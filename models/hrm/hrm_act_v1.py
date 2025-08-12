@@ -195,13 +195,13 @@ class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
                         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
 
                 if not (_H_step == self.config.H_cycles - 1):
-                    z_H = self.H_level(z_H, z_L, **seq_info)
+                    z_H = self.H_level(z_H, z_L + input_embeddings, **seq_info)
 
         assert not z_H.requires_grad and not z_L.requires_grad
 
         # 1-step grad
         z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.H_level(z_H, z_L, **seq_info)
+        z_H = self.H_level(z_H, z_L + input_embeddings, **seq_info)
 
         # LM Outputs
         new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
