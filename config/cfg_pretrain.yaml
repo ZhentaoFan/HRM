@@ -29,3 +29,8 @@ puzzle_emb_weight_decay: 0.1
 
 # Hyperparams - Puzzle embeddings training
 puzzle_emb_lr: 1e-2
+
+init_from_t5: null
+use_t5_arch_if_mismatch: false
+t5_use_rpb: true
+freeze_t5_prefix_layers: 0

@@ -9,11 +9,11 @@ halt_max_steps: 16
 H_cycles: 2
 L_cycles: 2
 
-H_layers: 4
-L_layers: 4
+H_layers: 6
+L_layers: 6
 
-hidden_size: 512
-num_heads: 8  # min(2, hidden_size // 64)
+hidden_size: 768
+num_heads: 12  # min(2, hidden_size // 64)
 expansion: 4
 
 puzzle_emb_ndim: ${.hidden_size}

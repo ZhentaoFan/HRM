@@ -172,128 +172,207 @@ def load_t5_model(t5_id: str):
     t5 = T5ForConditionalGeneration.from_pretrained(t5_id)
     return t5
 
+def peek_hrm_core(model: nn.Module, dump_file: str = "hrm_keys.txt"):
+    import io, itertools
+
+    def unwrap_core(m: nn.Module) -> nn.Module:
+        for attr in ["model", "module", "backbone", "net"]:
+            if hasattr(m, attr) and isinstance(getattr(m, attr), nn.Module):
+                return unwrap_core(getattr(m, attr))
+        return m
+
+    core = unwrap_core(model)
+    sd = core.state_dict()
+    keys = list(sd.keys())
+
+    # 层级前缀统计（看 encoder/decoder 的真实命名）
+    prefixes = set(".".join(k.split(".")[:3]) for k in keys if k.startswith(("encoder", "decoder")))
+    # 常见关键词分布
+    hits = {tag: [k for k in keys if tag in k.lower()] for tag in ["embed", "token", "puzzle_emb", "q_proj", "k_proj", "v_proj", "o_proj", "qkv", "mlp", "ff", "layer_norm", "rpb", "relative_attention_bias"]}
+
+    print("\n[PEEK] core type =", core.__class__.__name__)
+    print("[PEEK] total params =", len(keys))
+    print("[PEEK] first 40 keys:", keys[:40])
+    print("[PEEK] top-level encoder/decoder prefixes:", sorted(prefixes)[:20])
+    for tag, lst in hits.items():
+        print(f"[PEEK] {tag}: {len(lst)} hits")
+
+    # 写到文件里，方便你发我看
+    with open(dump_file, "w") as f:
+        f.write("\n".join(keys))
+
+    # 打几个关键张量的形状（有就打）
+    for probe in [
+        "embed_tokens.weight", "tokens_embedding.weight", "input_embed.weight", "puzzle_emb.weight",
+        "encoder.layers.0.self_attn.q_proj.weight", "encoder.layers.0.self_attn.k_proj.weight",
+        "encoder.layers.0.self_attn.v_proj.weight", "encoder.layers.0.self_attn.o_proj.weight",
+        "encoder.layers.0.attn.qkv.weight",
+        "encoder.blocks.0.self_attn.q_proj.weight", "encoder.blocks.0.self_attn.qkv.weight",
+        "encoder.layers.0.mlp.fc1.weight", "encoder.layers.0.mlp.fc2.weight",
+        "encoder.layers.0.ffn.wi.weight", "encoder.layers.0.ffn.wo.weight",
+        "encoder.layers.0.final_layer_norm.weight",
+        "decoder.layers.0.self_attn.q_proj.weight",
+    ]:
+        if probe in sd:
+            print("[PEEK] ", probe, sd[probe].shape)
+
 
 @torch.no_grad()
-def load_t5_into_hrm(hrm_model: nn.Module, t5_model: nn.Module, use_rpb: bool = True) -> Dict[str, Any]:
+def load_t5_into_hrm(hrm_model: nn.Module, t5_model: nn.Module, use_rpb: bool = False):
     """
-    Best-effort T5 -> HRM weight loading.
-    - Copy non-sparse token embedding: T5 `shared.weight` -> HRM `embed_tokens.weight` (or equivalents)
-    - (Optional) Copy Relative Position Bias (RPB) for encoder/decoder if present
-    - Try layerwise copy of Q/K/V/O, FFN, LNs with common naming; stop at first mismatch
-    - HRM-specific zL/zH are initialized robustly (T5 has no direct counterpart)
-    Returns a dict report: loaded/skipped/mismatched
+    Tailored for HierarchicalReasoningModel_ACTV1 key patterns:
+      - inner.embed_tokens.embedding_weight
+      - inner.(H_level|L_level).layers.{i}.self_attn.{qkv_proj|o_proj}.weight
+      - inner.(H_level|L_level).layers.{i}.mlp.{gate_up_proj|down_proj}.weight
+      - inner.lm_head.weight (optional)
     """
+    import re
     t5_sd = t5_model.state_dict()
-    hrm_sd = hrm_model.state_dict()
 
-    loaded: List[Tuple[str, str]] = []
-    skipped: List[Tuple[str, str]] = []
-    mismatched: List[Tuple[str, torch.Size, str, torch.Size]] = []
+    # ---- unwrap to .model.inner ----
+    core = hrm_model
+    for attr in ["model", "module", "backbone", "net"]:
+        if hasattr(core, attr) and isinstance(getattr(core, attr), nn.Module):
+            core = getattr(core, attr)
+    if hasattr(core, "inner") and isinstance(core.inner, nn.Module):
+        core = core.inner
 
-    def copy_(dst_key: str, src_key: str):
-        nonlocal loaded, skipped, mismatched
-        if src_key in t5_sd and dst_key in hrm_sd:
-            if hrm_sd[dst_key].shape == t5_sd[src_key].shape:
-                hrm_sd[dst_key].copy_(t5_sd[src_key])
-                loaded.append((dst_key, src_key))
-            else:
-                mismatched.append((dst_key, hrm_sd[dst_key].shape, src_key, t5_sd[src_key].shape))
+    hrm_sd = core.state_dict()
+    loaded, skipped, mismatched = [], [], []
+
+    def cp(dst, src, note=None):
+        if src not in t5_sd or dst not in hrm_sd:
+            skipped.append((dst, src))
+            return
+        if hrm_sd[dst].shape == t5_sd[src].shape:
+            hrm_sd[dst].copy_(t5_sd[src]); loaded.append((dst, src if note is None else f"{src}({note})"))
         else:
-            skipped.append((dst_key, src_key))
+            mismatched.append((dst, tuple(hrm_sd[dst].shape), src, tuple(t5_sd[src].shape)))
 
-    # 1) token embedding（非 sparse）
-    # Try several common names on HRM side
-    t5_embed = "shared.weight"
-    hrm_embed_candidates = [
-        "embed_tokens.weight",
-        "tokens_embedding.weight",
-        "model.embed_tokens.weight",
-        "model.tokens_embedding.weight",
-        "model.input_embed.weight",
-    ]
-    for k in hrm_embed_candidates:
-        if k in hrm_sd:
-            copy_(k, t5_embed)
-            break
+    # ---- 0) embed & lm_head ----
+    # embed
+    if "shared.weight" in t5_sd and "embed_tokens.embedding_weight" in hrm_sd:
+        if hrm_sd["embed_tokens.embedding_weight"].shape == t5_sd["shared.weight"].shape:
+            hrm_sd["embed_tokens.embedding_weight"].copy_(t5_sd["shared.weight"])
+            loaded.append(("embed_tokens.embedding_weight", "shared.weight"))
+        else:
+            mismatched.append(("embed_tokens.embedding_weight", tuple(hrm_sd["embed_tokens.embedding_weight"].shape),
+                               "shared.weight", tuple(t5_sd["shared.weight"].shape)))
+    # lm_head（可选）
+    if "lm_head.weight" in hrm_sd:
+        src = "lm_head.weight" if "lm_head.weight" in t5_sd else "shared.weight"
+        if hrm_sd["lm_head.weight"].shape == t5_sd[src].shape:
+            hrm_sd["lm_head.weight"].copy_(t5_sd[src]); loaded.append(("lm_head.weight", src))
+        else:
+            skipped.append(("lm_head.weight", src))
 
-    # 2) RPB（若启用 & 存在）
-    if use_rpb:
-        # T5 encoder/decoder RPB lives at block.0 SelfAttention.relative_attention_bias.weight
-        t5_enc_rpb = "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        t5_dec_rpb = "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
-        hrm_rpb_keys = [
-            "encoder.rpb.weight",
-            "decoder.rpb.weight",
-            "encoder.relative_attention_bias.weight",
-            "decoder.relative_attention_bias.weight",
-            "model.encoder.rpb.weight",
-            "model.decoder.rpb.weight",
-            "model.encoder.relative_attention_bias.weight",
-            "model.decoder.relative_attention_bias.weight",
-        ]
-        for dst in hrm_rpb_keys:
-            if dst.startswith("encoder") and t5_enc_rpb in t5_sd and dst in hrm_sd:
-                copy_(dst, t5_enc_rpb)
-            if dst.startswith("decoder") and t5_dec_rpb in t5_sd and dst in hrm_sd:
-                copy_(dst, t5_dec_rpb)
-
-    # 3) 层对齐（示例命名；请按你工程实际命名替换/增补）
-    def layerwise_copy(side_hrm_prefix: str, side_t5_prefix: str):
-        # Probe how many layers exist on HRM side by checking q_proj
-        hrm_layer_ids = []
+    # ---- 1) 找到 H/L 两个 level 和层数 ----
+    def find_layers(level_name: str):
+        pat = re.compile(rf"^{level_name}\.layers\.(\d+)\.self_attn\.qkv_proj\.weight$")
+        idxs = []
         for k in hrm_sd.keys():
-            if k.startswith(f"{side_hrm_prefix}.layers.") and k.endswith("self_attn.q_proj.weight"):
-                try:
-                    idx = int(k.split(".")[2])
-                    hrm_layer_ids.append(idx)
-                except Exception:
-                    pass
-        if not hrm_layer_ids:
-            return  # no recognizable layers
+            m = pat.match(k)
+            if m: idxs.append(int(m.group(1)))
+        return sorted(set(idxs))
 
-        max_layers = max(hrm_layer_ids) + 1
-        for i in range(max_layers):
-            mapping = [
-                (f"{side_hrm_prefix}.layers.{i}.self_attn.q_proj.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.0.SelfAttention.q.weight"),
-                (f"{side_hrm_prefix}.layers.{i}.self_attn.k_proj.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.0.SelfAttention.k.weight"),
-                (f"{side_hrm_prefix}.layers.{i}.self_attn.v_proj.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.0.SelfAttention.v.weight"),
-                (f"{side_hrm_prefix}.layers.{i}.self_attn.o_proj.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.0.SelfAttention.o.weight"),
-                (f"{side_hrm_prefix}.layers.{i}.self_attn_layer_norm.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.0.layer_norm.weight"),
-                # FFN（T5 DenseReluDense）
-                (f"{side_hrm_prefix}.layers.{i}.mlp.fc1.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.1.DenseReluDense.wi.weight"),
-                (f"{side_hrm_prefix}.layers.{i}.mlp.fc2.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.1.DenseReluDense.wo.weight"),
-                (f"{side_hrm_prefix}.layers.{i}.final_layer_norm.weight",
-                 f"{side_t5_prefix}.block.{i}.layer.1.layer_norm.weight"),
-            ]
-            # If any one mapping mismatches in shape → consider arch mismatch
-            for dst, src in mapping:
-                if dst in hrm_sd and src in t5_sd:
-                    if hrm_sd[dst].shape != t5_sd[src].shape:
-                        mismatched.append((dst, hrm_sd[dst].shape, src, t5_sd[src].shape))
-                        return
-                    hrm_sd[dst].copy_(t5_sd[src])
-                    loaded.append((dst, src))
+    levels = []
+    for lv in ["H_level", "L_level"]:
+        if any(k.startswith(f"{lv}.layers.") for k in hrm_sd.keys()):
+            levels.append(lv)
 
-    layerwise_copy("encoder", "encoder")
-    layerwise_copy("decoder", "decoder")
+    # ---- 2) per-layer: attn qkv/o, mlp gate_up/down ----
+    # T5 keys
+    def t5_qkv_keys(i, side):  # side: "encoder"/"decoder"
+        pref = f"{side}.block.{i}.layer.0.SelfAttention"
+        return f"{pref}.q.weight", f"{pref}.k.weight", f"{pref}.v.weight", f"{pref}.o.weight"
 
-    # 4) zL / zH 初始化（T5 无对应）
-    for name in ["zL_init", "zH_init", "zL_proj.weight", "zH_proj.weight",
-                 "model.zL_init", "model.zH_init", "model.zL_proj.weight", "model.zH_proj.weight"]:
-        if name in hrm_sd:
-            if hrm_sd[name].dim() == 1:
-                nn.init.zeros_(hrm_sd[name])
+    def t5_ffn_keys(i, side):
+        """
+        Return (wi, wo, wi_0, wi_1) keys for T5 FFN.
+        Encoder FFN is at layer.1; Decoder FFN is at layer.2 (layer.1 is cross-attn).
+        """
+        ffn_layer_idx = 1 if side == "encoder" else 2
+        pref = f"{side}.block.{i}.layer.{ffn_layer_idx}"
+        wi = f"{pref}.DenseReluDense.wi.weight"
+        wo = f"{pref}.DenseReluDense.wo.weight"
+        wi_0 = f"{pref}.DenseReluDense.wi_0.weight"
+        wi_1 = f"{pref}.DenseReluDense.wi_1.weight"
+        return wi, wo, wi_0, wi_1
+
+
+    # 猜测 side：H_level 对应 encoder，L_level 对应 decoder（不重要，只是取对应索引）
+    side_map = {"H_level": "decoder", "L_level": "encoder"}
+
+    for lv in levels:
+        side = side_map.get(lv, "encoder")
+        layer_ids = find_layers(lv)
+        for i in layer_ids:
+            # ---- self-attn qkv ----
+            dst_qkv = f"{lv}.layers.{i}.self_attn.qkv_proj.weight"
+            dst_o   = f"{lv}.layers.{i}.self_attn.o_proj.weight"
+            if dst_qkv in hrm_sd:
+                tq, tk, tv, to = t5_qkv_keys(i, side)
+                if all(k in t5_sd for k in (tq, tk, tv)):
+                    Wq, Wk, Wv = t5_sd[tq], t5_sd[tk], t5_sd[tv]
+                    Wqkv = None
+                    # 判定拼接维：Linear.weight 是 [out, in]
+                    h_out, h_in = hrm_sd[dst_qkv].shape
+                    q_out, q_in = Wq.shape
+                    # 优先沿 out 维拼接
+                    if 3 * q_out == h_out and q_in == h_in:
+                        Wqkv = torch.cat([Wq, Wk, Wv], dim=0)
+                    # 退而沿 in 维拼接
+                    elif q_out == h_out and 3 * q_in == h_in:
+                        Wqkv = torch.cat([Wq, Wk, Wv], dim=1)
+                    if Wqkv is not None and Wqkv.shape == hrm_sd[dst_qkv].shape:
+                        hrm_sd[dst_qkv].copy_(Wqkv); loaded.append((dst_qkv, f"{tq}|{tk}|{tv}"))
+                    else:
+                        mismatched.append((dst_qkv, tuple(hrm_sd[dst_qkv].shape),
+                                           "q|k|v", (tuple(Wq.shape), tuple(Wk.shape), tuple(Wv.shape))))
+                else:
+                    skipped.append((dst_qkv, "t5 q/k/v"))
+            if dst_o in hrm_sd:
+                _, _, _, to = t5_qkv_keys(i, side)
+                cp(dst_o, to)
+
+            # ---- MLP ----
+            dst_gate_up = f"{lv}.layers.{i}.mlp.gate_up_proj.weight"
+            dst_down    = f"{lv}.layers.{i}.mlp.down_proj.weight"
+            wi, wo, wi0, wi1 = t5_ffn_keys(i, side)
+
+            # down_proj ~ wo
+            if dst_down in hrm_sd and wo in t5_sd:
+                if hrm_sd[dst_down].shape == t5_sd[wo].shape:
+                    hrm_sd[dst_down].copy_(t5_sd[wo]); loaded.append((dst_down, wo))
+                else:
+                    mismatched.append((dst_down, tuple(hrm_sd[dst_down].shape), wo, tuple(t5_sd[wo].shape)))
             else:
-                nn.init.normal_(hrm_sd[name], mean=0.0, std=0.02)
+                skipped.append((dst_down, wo))
 
-    hrm_model.load_state_dict(hrm_sd, strict=False)
+            # gate_up_proj ~ wi / (wi_0, wi_1)
+            if dst_gate_up in hrm_sd:
+                H_out, H_in = hrm_sd[dst_gate_up].shape
+                if wi0 in t5_sd and wi1 in t5_sd:
+                    W = torch.cat([t5_sd[wi0], t5_sd[wi1]], dim=0)  # [2*d_ff, d_model]
+                    if W.shape == hrm_sd[dst_gate_up].shape:
+                        hrm_sd[dst_gate_up].copy_(W); loaded.append((dst_gate_up, f"{wi0}|{wi1}"))
+                    else:
+                        mismatched.append((dst_gate_up, tuple(hrm_sd[dst_gate_up].shape),
+                                           "wi_0|wi_1", (tuple(t5_sd[wi0].shape), tuple(t5_sd[wi1].shape))))
+                elif wi in t5_sd:
+                    W = t5_sd[wi]
+                    if W.shape == hrm_sd[dst_gate_up].shape:
+                        hrm_sd[dst_gate_up].copy_(W); loaded.append((dst_gate_up, wi))
+                    elif (2 * W.shape[0] == H_out) and (W.shape[1] == H_in):
+                        W2 = torch.cat([W, W], dim=0)
+                        hrm_sd[dst_gate_up].copy_(W2); loaded.append((dst_gate_up, f"{wi}x2"))
+                    else:
+                        mismatched.append((dst_gate_up, tuple(hrm_sd[dst_gate_up].shape), wi, tuple(W.shape)))
+                else:
+                    skipped.append((dst_gate_up, "wi/wi_0,wi_1"))
+
+    # ---- 写回 ----
+    core.load_state_dict(hrm_sd, strict=False)
     return {"loaded": loaded, "skipped": skipped, "mismatched": mismatched}
 
 
@@ -330,7 +409,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cfg = dict(
         **config.arch.__pydantic_extra__,  # type: ignore
         batch_size=config.global_batch_size // world_size,
-        vocab_size=train_metadata.vocab_size,
+        vocab_size=32128, #train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
         causal=False  # Non-autoregressive
@@ -354,6 +433,20 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
         # Try to load into HRM (embedding + optional RPB + layers if shapes align)
         try:
             report = load_t5_into_hrm(model, t5, use_rpb=config.t5_use_rpb)
+            loaded_n = len(report.get("loaded", []))
+            mism_n   = len(report.get("mismatched", []))
+            skip_n   = len(report.get("skipped", []))
+
+            def rank0_print(msg: str):
+                if world_size <= 1 or dist.get_rank() == 0:
+                    print(msg)
+
+            rank0_print(f"[T5→HRM] load summary: loaded={loaded_n}, mismatched={mism_n}, skipped={skip_n}")
+
+            # 可选：展示前 5 条成功映射，便于确认参数名是否对齐
+            for i, (dst, src) in enumerate(report.get("loaded", [])[:]):
+                rank0_print(f"  [loaded {i+1}] {src} -> {dst}")
+
             if report["mismatched"]:
                 if config.use_t5_arch_if_mismatch:
                     # Fall back to wrapper
